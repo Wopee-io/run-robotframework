@@ -1,5 +1,5 @@
 name: Run Robot Framework tests
-description: "Runs Robot Framework tests via npm test"
+description: "Runs Robot Framework tests (robot -d results tests)"
 branding:
   icon: "fast-forward"
   color: "purple"
@@ -14,6 +14,19 @@ runs:
       run: |
         echo "WOPEE_SCREENSHOT_VALIDATION_ENABLED=${WOPEE_SCREENSHOT_VALIDATION_ENABLED:-true}" >> $GITHUB_ENV
         echo "WOPEE_COLLECT_PAGE_CONTENT=${WOPEE_COLLECT_PAGE_CONTENT:-true}" >> $GITHUB_ENV
+        echo "WOPEE_DRIVER_LIBRARY=${WOPEE_DRIVER_LIBRARY:-BrowserLibrary}" >> $GITHUB_ENV
+
+    - name: Load .github/workflows/.env → $GITHUB_ENV
+      # Loaded before the dispatch payload, so values sent by Commander win.
+      shell: bash
+      run: |
+        if [ -f .github/workflows/.env ]; then
+          # Valid KEY=VALUE lines only; unfilled template placeholders like {wopeeProjectUuid} are skipped.
+          grep -vE '^(#|$)' .github/workflows/.env | \
+            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | \
+            grep -vE '=\{[A-Za-z]+\}$' \
+            >> "$GITHUB_ENV" || true
+        fi
 
     - name: Load client_payload.env → $GITHUB_ENV
       if: github.event.client_payload.env
@@ -29,24 +42,41 @@ runs:
             end
         ' "$GITHUB_EVENT_PATH" >> "$GITHUB_ENV"
 
-    - name: Load .github/workflows/.env → $GITHUB_ENV
+    - name: Set suite name if provided
+      if: github.event_name == 'repository_dispatch' && github.event.client_payload.suite.name != null
       shell: bash
       run: |
-        if [ -f .github/workflows/.env ]; then
-          # Extract valid KEY=VALUE lines; if none are found, skip without failing the step
-          grep -vE '^(#|$)' .github/workflows/.env | \
-            grep -E '^[A-Za-z_][A-Za-z0-9_]*=' \
-            >> "$GITHUB_ENV" || true
+        echo 'WOPEE_SUITE_NAME=${{ github.event.client_payload.suite.name }}' >> $GITHUB_ENV
+
+    - name: Check project settings
+      shell: bash
+      run: |
+        if [ -z "${WOPEE_PROJECT_UUID:-}" ]; then
+          echo "::error title=WOPEE_PROJECT_UUID is not set::Add WOPEE_PROJECT_UUID (and WOPEE_API_URL, WOPEE_PROJECT_URL) as uncommented KEY=value lines to .github/workflows/.env. Commander › More › Settings › API Keys shows the values."
+          exit 1
+        fi
+
+    - name: Install
+      shell: bash
+      run: |
+        python3 -m venv --system-site-packages .venv
+        source .venv/bin/activate
+        pip install -r requirements.txt
+        # Download the Browser library's Node.js dependencies and Chromium unless they are already there.
+        if ! python -c "import Browser, pathlib, sys; sys.exit(0 if (pathlib.Path(Browser.__file__).parent / 'wrapper' / 'node_modules').is_dir() else 1)"; then
+          rfbrowser init chromium
         fi
 
     - name: Run tests
       shell: bash
       run: |
-        python3 -m venv --system-site-packages .venv && \
-        source .venv/bin/activate && \
-        pip install -r requirements.txt && \
-        [ ! -e ".env" ] && cp .github/workflows/.env .env || echo ".env file already exists"
-        make test
+        source .venv/bin/activate
+        # Repos generated before Oct 2026 run their tests through `make test`.
+        if [ -f Makefile ] && grep -q '^test:' Makefile; then
+          make test
+        else
+          robot -d results tests
+        fi
 
     - name: Confirm end of run
       if: always()
@@ -98,5 +128,7 @@ runs:
         # use timestamp for artifact name
         name: robot-framework-results-${{ env.ARTIFACT_TIMESTAMP }}
         path: |
+          results/*
           reports/*
         retention-days: 1
+        if-no-files-found: ignore
